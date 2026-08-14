@@ -34,21 +34,31 @@ jobs:
         with:
           go-version-file: ${{ inputs.go-version-file }}
 
-      - name: Install podman-compose
+      # Do not install Podman: compose service_healthy needs healthchecks that
+      # actually run. Dockerd does that. Podman relies on systemd user timers
+      # that often never fire on GHA (stuck starting / Log=null). 
+      # See: https://github.com/podman-container-tools/podman/pull/27033
+      # Prefer docker when both exist on the runner.
+      - name: Detect container engine
         run: |
-          sudo apt-get update
-          sudo apt-get install -y podman
-          pip install podman-compose==1.6.0
-          sudo loginctl enable-linger "$(id -un)"
-          timeout 30 bash -c 'until [ -d /run/user/$(id -u) ]; do sleep 0.5; done'
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          if command -v docker >/dev/null 2>&1; then
+            engine=docker
+          elif command -v podman >/dev/null 2>&1; then
+            engine=podman
+          else
+            echo "No docker or podman found on the runner" >&2
+            exit 1
+          fi
+          echo "CONTAINER_ENGINE=$engine" >> "$GITHUB_ENV"
+          echo "Using CONTAINER_ENGINE=$engine"
+          "$engine" version
 
       - name: Pre-pull container images
         if: inputs.images != ''
         run: |
           for img in ${{ inputs.images }}; do
             for i in 1 2 3; do
-              podman pull "$img" && break
+              "$CONTAINER_ENGINE" pull "$img" && break
               [ $i -eq 3 ] && exit 1
               echo "Pull failed, retrying in 15s..."
               sleep 15
@@ -66,23 +76,25 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          echo "::group::podman ps -a"
-          podman ps -a
+          engine="${CONTAINER_ENGINE:-docker}"
+
+          echo "::group::${engine} ps -a"
+          "$engine" ps -a
           echo "::endgroup::"
 
           echo "::group::container health"
-          for c in $(podman ps -aq 2>/dev/null); do
-            name=$(podman inspect --format '{{.Name}}' "$c" 2>/dev/null || echo "$c")
+          for c in $("$engine" ps -aq 2>/dev/null); do
+            name=$("$engine" inspect --format '{{.Name}}' "$c" 2>/dev/null || echo "$c")
             echo "--- $name ---"
-            podman inspect --format '{{json .State.Health}}' "$c"
+            "$engine" inspect --format '{{json .State.Health}}' "$c"
           done
           echo "::endgroup::"
 
           echo "::group::container logs"
-          for c in $(podman ps -aq 2>/dev/null); do
-            name=$(podman inspect --format '{{.Name}}' "$c" 2>/dev/null || echo "$c")
+          for c in $("$engine" ps -aq 2>/dev/null); do
+            name=$("$engine" inspect --format '{{.Name}}' "$c" 2>/dev/null || echo "$c")
             echo "--- $name ---"
-            podman logs --tail 200 "$c"
+            "$engine" logs --tail 200 "$c"
           done
           echo "::endgroup::"
 
